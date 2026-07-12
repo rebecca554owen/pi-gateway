@@ -45,6 +45,8 @@ export interface CommandDef {
 	role: CommandRole;
 	/** Handler — if omitted, the command just shows help text */
 	handler?: CommandHandler;
+	/** Whether this command needs the pi RPC agent (default: true) */
+	requiresAgent?: boolean;
 }
 
 // ── Registry ────────────────────────────────────────────────
@@ -108,7 +110,7 @@ export function buildTelegramCommands(): Array<{
 }> {
 	return registry.map((cmd) => ({
 		command: cmd.name,
-		description: cmd.description.slice(0, 50), // Telegram caps descriptions
+		description: cmd.description.slice(0, 128), // Telegram cap (256 chars total, but 128 is safe)
 	}));
 }
 
@@ -132,6 +134,7 @@ export function buildHelpText(): string {
 export function registerBuiltinCommands(): void {
 	registerCommand({
 		name: "help",
+		requiresAgent: false,
 		aliases: ["commands"],
 		description: "Show available commands",
 		role: "any",
@@ -413,12 +416,12 @@ async function handleModelList(ctx: CommandContext): Promise<void> {
 		const list = result.data.models
 			.map(
 				(m) =>
-					`${m.name || m.id} (\`${m.provider}/${m.id}\`)`,
+					`${m.name || m.id} (<code>${m.provider}/${m.id}</code>)`,
 			)
 			.join("\n");
 
 		await ctx.sendReply(
-			`Available models:\n${list}\n\nUse \`/model provider/id\` to switch.`,
+			`Available models:\n${list}\n\nUse <code>/model provider/id</code> to switch.`,
 		);
 	} catch (err) {
 		ctx.logger.error("Failed to list models", err);

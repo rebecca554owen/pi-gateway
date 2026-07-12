@@ -217,7 +217,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
 		dailyHour: 4,
 		idleMinutes: 1440,
 	},
-	promptTimeoutMs: 300000, // 5 minutes — override to increase for slow models
+	promptTimeoutMs: 900000, // 15 minutes — enough for multi-turn tool calls
 	platforms: {},
 };
 
@@ -264,13 +264,25 @@ const pendingRequests: PendingRequest[] = [];
 interface PendingCompletion {
 	resolve: (text: string) => void;
 	reject: (err: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
 	/** Called with accumulated streaming text as deltas arrive */
 	onStream?: (text: string) => void;
 	/** Accumulated streamed text from text_delta events */
 	streamedText: string;
+	/** Reset the idle watchdog — called on every streaming event */
+	resetIdle: () => void;
+	/** Stop the idle watchdog entirely (after agent_end) */
+	stopIdle: () => void;
+	/** Set to true after resolve/reject to prevent double-settlement */
+	settled: boolean;
 }
 const pendingCompletions: PendingCompletion[] = [];
+
+/** Reset idle watchdog on all pending completions — called from stdout handler on streaming */
+function touchPendingCompletions(): void {
+	for (const c of pendingCompletions) {
+		c.resetIdle();
+	}
+}
 
 // Re-entrant guard for RPC respawn (debounce multiple exit events)
 let _rpcRespawnTimer: ReturnType<typeof setTimeout> | null = null;
@@ -286,6 +298,7 @@ interface QueuedMessage {
 
 const pendingMessageQueue: QueuedMessage[] = [];
 const MAX_QUEUE_RETRIES = 5;
+const MAX_QUEUE_SIZE = 16;
 const QUEUE_RETRY_DELAY_MS = 3000;
 
 /** Process one queued message. Returns true if it was handed off to the RPC flow. */
@@ -452,12 +465,14 @@ function createRpcProcess(): any {
 					);
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						clearTimeout(completion.timer);
+						completion.stopIdle();
 						completion.resolve(text);
 					}
 					// Clean up any pending interactive prompts
 					cleanupPendingUiRequests();
 					setActiveChannel(null);
+					// After agent_end, try to drain any queued messages
+					drainPendingMessageQueue();
 				}
 
 				// Handle extension UI requests (select, confirm, input, etc.)
@@ -478,16 +493,20 @@ function createRpcProcess(): any {
 					}
 				}
 
-				// Stream text deltas to active completion
-				if (
-					msg.type === "message_update" &&
-					msg.assistantMessageEvent?.type === "text_delta" &&
-					typeof msg.assistantMessageEvent.delta === "string"
-				) {
+				// Stream text deltas + thinking progress to active completion
+				if (msg.type === "message_update") {
 					const completion = pendingCompletions[0];
 					if (completion?.onStream) {
-						completion.streamedText += msg.assistantMessageEvent.delta;
-						completion.onStream(completion.streamedText);
+						const ev = msg.assistantMessageEvent;
+						if (ev?.type === "text_delta" && typeof ev.delta === "string") {
+							completion.streamedText += ev.delta;
+							completion.onStream(completion.streamedText);
+						} else if (ev?.type === "thinking_delta" && typeof ev.delta === "string") {
+							// Show thinking progress as a short status line
+							const lines = ev.delta.trim().split("\n");
+							const lastLine = lines[lines.length - 1].slice(-80);
+							completion.onStream(`💭 ${lastLine}`);
+						}
 					}
 				}
 
@@ -497,6 +516,9 @@ function createRpcProcess(): any {
 				} else {
 					broadcastClients("event", msg);
 				}
+
+				// Any event from pi resets the idle watchdog
+				touchPendingCompletions();
 			} catch {
 				logger.debug("[gateway] Failed to parse RPC line:", line.slice(0, 200));
 			}
@@ -520,7 +542,7 @@ function createRpcProcess(): any {
 					);
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						clearTimeout(completion.timer);
+						completion.stopIdle();
 						completion.resolve(text);
 					}
 				}
@@ -531,7 +553,7 @@ function createRpcProcess(): any {
 		// Reject any remaining pending completions so they don't hang forever
 		while (pendingCompletions.length > 0) {
 			const completion = pendingCompletions.shift()!;
-			clearTimeout(completion.timer);
+			completion.stopIdle();
 			completion.reject(new Error(`pi process exited with code ${code}`));
 		}
 		// Clean up any pending interactive UI requests
@@ -564,6 +586,7 @@ function createRpcProcess(): any {
 async function sendRpc(
 	command: string,
 	data: Record<string, unknown> = {},
+	timeoutMs: number = 30000,
 ): Promise<unknown> {
 	if (!rpcProcess) throw new Error("pi agent not running");
 
@@ -587,7 +610,7 @@ async function sendRpc(
 				pendingRequests.splice(idx, 1);
 				reject(new Error("Request timeout"));
 			}
-		}, 30000);
+		}, timeoutMs);
 	});
 }
 
@@ -633,40 +656,62 @@ async function sendPromptRpc(
 
 	logger.info("[gateway] Prompt ACK received, waiting for agent_end...");
 
-	// Wait for agent_end to deliver the full response
-	const timeoutMs = config.promptTimeoutMs ?? 300000;
-	const minutes = Math.round(timeoutMs / 60000);
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			const idx = pendingCompletions.findIndex((c) => c.timer === timer);
-			if (idx !== -1) pendingCompletions.splice(idx, 1);
-			// Kill stuck RPC process and spawn a fresh one
-			logger.warn("[gateway] Prompt timeout — restarting RPC process");
+	// Wait for agent_end to deliver the full response.
+	// Uses an IDLE watchdog: the timer resets on every streaming event from pi
+	// (thinking_delta, text_delta, etc.), so the model can think as long as it
+	// needs — but if it's truly stuck (no events for idleTimeoutMs), we restart.
+	const idleTimeoutMs = 90000; // 90 seconds of silence = stuck
+	let idleTimer: ReturnType<typeof setTimeout> | null = null;
+	let completion: PendingCompletion | null = null;
+
+	const settle = (err: Error | null, text: string): void => {
+		if (!completion || completion.settled) return;
+		completion.settled = true;
+		if (idleTimer) clearTimeout(idleTimer);
+		if (err) completion.reject(err);
+		else completion.resolve(text);
+		// Remove from array
+		const idx = pendingCompletions.indexOf(completion);
+		if (idx !== -1) pendingCompletions.splice(idx, 1);
+	};
+
+	const startIdle = (): void => {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			logger.warn("[gateway] Idle timeout — restarting RPC process");
 			if (rpcProcess) {
 				rpcProcess.kill("SIGTERM");
 				rpcProcess = null;
 			}
 			try {
 				rpcProcess = createRpcProcess();
-				logger.info("[gateway] RPC process restarted after timeout");
+				logger.info("[gateway] RPC process restarted after idle timeout");
 				drainPendingMessageQueue();
 			} catch (e) {
-				logger.error("[gateway] Failed to restart RPC process after timeout:", e);
+				logger.error("[gateway] Failed to restart RPC after idle timeout:", e);
 			}
-			reject(
-				new Error(
-					`Prompt completion timeout — no agent_end received within ${minutes} minute${minutes === 1 ? "" : "s"}`,
-				),
-			);
-		}, timeoutMs);
+			settle(new Error("Prompt idle timeout — no events from agent for 90 seconds"), "");
+		}, idleTimeoutMs);
+	};
 
-		pendingCompletions.push({
-			resolve,
-			reject,
-			timer,
+	const stopIdle = (): void => {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = null;
+	};
+
+	startIdle();
+
+	return new Promise((_resolve, _reject) => {
+		completion = {
+			resolve: _resolve,
+			reject: _reject,
 			onStream,
 			streamedText: "",
-		});
+			resetIdle: startIdle,
+			stopIdle,
+			settled: false,
+		};
+		pendingCompletions.push(completion);
 	});
 }
 
@@ -704,7 +749,9 @@ const adapterCallbacks: AdapterCallbacks = {
 		const matched = matchCommand(message.content);
 		if (matched) {
 			const adapter = state.adapters.get(message.platform);
-			if (!rpcProcess) {
+			// RPC-independent commands (e.g. /help) don't need the agent
+			const needsAgent = matched.cmd.requiresAgent !== false;
+			if (needsAgent && !rpcProcess) {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
@@ -757,9 +804,23 @@ const adapterCallbacks: AdapterCallbacks = {
 			return;
 		}
 
-		// Send to pi agent with tool policy guard// Send to pi agent with tool policy guard
+		// Send to pi agent with tool policy guard
 		if (rpcProcess) {
 			const adapter = state.adapters.get(message.platform);
+
+			// Pre-flight health check: if pi is unresponsive, restart it safely
+			try {
+				await sendRpc("get_state", {}, 3000);
+			} catch {
+				logger.warn("[gateway] pi agent unresponsive — restarting");
+				// Cancel any pending auto-respawn before killing
+				if (_rpcRespawnTimer) {
+					clearTimeout(_rpcRespawnTimer);
+					_rpcRespawnTimer = null;
+				}
+				rpcProcess.kill("SIGTERM");
+				rpcProcess = createRpcProcess();
+			}
 			const guard = buildPolicyGuard(message.platform, message.userId);
 
 			// ══ Session continuity: resume_pending detection ══
@@ -781,8 +842,9 @@ const adapterCallbacks: AdapterCallbacks = {
 
 				message.content = `${resumeNote}\n\n${message.content}`;
 				logger.info(`[gateway] Injected resume context for session ${session.id.slice(0, 12)}...`);
-				// Clear resume_pending immediately so retries don't re-inject context
+				// Clear resume_pending in both DB and memory so retries don't re-inject context
 				clearResumePending(session.id);
+				session.resumePending = false;
 			}
 			// ════════════════════════════════════════════════
 
@@ -852,7 +914,8 @@ const adapterCallbacks: AdapterCallbacks = {
 				let lastEditTime = 0;
 				const EDIT_THROTTLE_MS = 400; // max 2.5 edits/sec to avoid rate limits
 				const responseText = await sendPromptRpc(
-					`${guard}\n\n${message.content}`,
+					// Limit response length via system instruction
+					`${guard}\n\n[Keep responses concise and to the point. Max ~4000 tokens.]\n\n${message.content}`,
 					adapter && sentId
 						? (streamText: string) => {
 								const now = Date.now();
@@ -915,6 +978,7 @@ const adapterCallbacks: AdapterCallbacks = {
 
 				} else if (!responseText && adapter) {
 					logger.warn("[gateway] Response text was empty — nothing to send");
+					drainPendingMessageQueue();
 					if (sentId) {
 						await adapter.editMessage(
 							message.channelId,

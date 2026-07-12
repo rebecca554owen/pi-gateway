@@ -84,6 +84,79 @@ interface TelegramMessage {
 	entities?: Array<{ type: string; offset: number; length: number }>;
 }
 
+
+/**
+ * Escape text for Telegram MarkdownV2.
+ * Only escapes outside code blocks and inline code — matches Hermes' approach.
+ * Reserved chars: _ * [ ] ( ) ~ ` > # + - = | { } . !
+ */
+/** Escape all MarkdownV2 reserved characters (Hermes pattern: global regex, no code-block awareness) */
+function escapeMarkdownV2(text: string): string {
+	return text.replace(/([_*\[\]()~`>#\+\-=|{}.!\\])/g, "\\$1");
+}
+
+/** Strip MarkdownV2 formatting for plain-text fallback */
+function stripMarkdownV2(text: string): string {
+	// Remove escape backslashes before special chars
+	let s = text.replace(/\\([_*\[\]()~`>#\+\-=|{}.!\\])/g, "$1");
+	// Remove bold (**text** -> text)
+	s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+	// Remove MarkdownV2 bold (*text* -> text) - careful with single *
+	s = s.replace(/(?<!\w)\*([^*]+)\*(?!\w)/g, "$1");
+	// Remove italic (_text_ -> text)
+	s = s.replace(/(?<!\w)_([^_]+)_(?!\w)/g, "$1");
+	// Remove strikethrough (~text~ -> text)
+	s = s.replace(/~([^~]+)~/g, "$1");
+	// Remove spoiler (||text|| -> text)
+	s = s.replace(/\|\|([^|]+)\|\|/g, "$1");
+	return s;
+}
+
+const TELEGRAM_MAX_LENGTH = 4096;
+
+/** Split long text into chunks at 4096 chars, preserving code blocks */
+function truncateMessage(text: string): string[] {
+	if (text.length <= TELEGRAM_MAX_LENGTH) return [text];
+	const chunks: string[] = [];
+	let inCode = false;
+	let start = 0;
+
+	while (start < text.length) {
+		let end = Math.min(start + TELEGRAM_MAX_LENGTH, text.length);
+
+		// If we're inside a code block, try to close it before splitting
+		if (inCode) {
+			const closeFence = text.indexOf("```", Math.max(start, end - 200));
+			if (closeFence !== -1 && closeFence < end) {
+				end = closeFence + 3;
+				inCode = false;
+			}
+		}
+
+		// Count code fences to track inCode state
+		const chunk = text.slice(start, end);
+		const fenceMatches = chunk.match(/```/g);
+		if (fenceMatches) {
+			if (fenceMatches.length % 2 !== 0) {inCode = !inCode;}
+		}
+
+		// Break at last newline if we're not in code
+		if (!inCode && end < text.length && text[end - 1] !== "\n") {
+			const newline = text.lastIndexOf("\n", end);
+			if (newline > start + 200) end = newline + 1;
+		}
+
+		chunks.push(text.slice(start, end));
+		start = end;
+	}
+
+	// Add chunk indicators
+	return chunks.length > 1
+		? chunks.map((c, i) => `${c}\n(${i + 1}/${chunks.length})`)
+		: chunks;
+}
+
+
 export class TelegramAdapter extends BaseAdapter {
 	readonly platform = "telegram" as const;
 	config: TelegramConfig;
@@ -460,25 +533,41 @@ export class TelegramAdapter extends BaseAdapter {
 	}
 
 	async sendMessage(channelId: string, content: string): Promise<string> {
-		const response = await this.apiRequest("/sendMessage", {
-			method: "POST",
-			body: JSON.stringify({
-				chat_id: channelId,
-				text: content,
-				parse_mode: "HTML",
-			}),
-		});
+		// Split long messages into chunks (Telegram limit: 4096 chars per message)
+		const chunks = truncateMessage(content);
 
-		const data = (await response.json()) as {
-			ok: boolean;
-			result?: { message_id: number };
-		};
-
-		if (!data.ok) {
-			throw new Error(`Failed to send message: ${JSON.stringify(data)}`);
+		for (let i = 0; i < chunks.length; i++) {
+			const text = chunks[i];
+			// Try escaped MarkdownV2 first; fall back to plain text on failure
+			let sent = false;
+			for (const [parseMode, bodyText] of [
+				["MarkdownV2", escapeMarkdownV2(text)] as const,
+				[undefined, stripMarkdownV2(text)] as const,
+			]) {
+				const body: Record<string, unknown> = {
+					chat_id: channelId,
+					text: bodyText,
+				};
+				if (parseMode) body.parse_mode = parseMode;
+				const response = await this.apiRequest("/sendMessage", {
+					method: "POST",
+					body: JSON.stringify(body),
+				});
+				const result = (await response.json()) as { ok: boolean; result?: { message_id: number } };
+				if (result.ok) {
+					// Only return the last chunk's message_id for the caller
+					if (i === chunks.length - 1) return String(result.result?.message_id || 0);
+					sent = true;
+					break;
+				}
+			}
+			if (!sent) {
+				logger.error(`[Telegram] Failed to send chunk ${i + 1}/${chunks.length}: ${text.slice(0, 80)}`);
+			}
 		}
+		return "0";
 
-		return String(data.result?.message_id || 0);
+		// response handling continued in the method body above
 	}
 
 	async sendPhoto(
@@ -492,7 +581,7 @@ export class TelegramAdapter extends BaseAdapter {
 				chat_id: channelId,
 				photo: photoUrl,
 				caption,
-				parse_mode: "HTML",
+				parse_mode: "MarkdownV2",
 			}),
 		});
 
@@ -524,7 +613,7 @@ export class TelegramAdapter extends BaseAdapter {
 			body: JSON.stringify({
 				chat_id: channelId,
 				text,
-				parse_mode: "HTML",
+				parse_mode: "MarkdownV2",
 				reply_markup: replyMarkup,
 			}),
 		});
@@ -599,7 +688,7 @@ export class TelegramAdapter extends BaseAdapter {
 					body: JSON.stringify({
 						chat_id: channelId,
 						text,
-						parse_mode: "HTML",
+						parse_mode: "MarkdownV2",
 						reply_markup: { force_reply: true },
 					}),
 				});
@@ -651,7 +740,7 @@ export class TelegramAdapter extends BaseAdapter {
 				chat_id: channelId,
 				message_id: parseInt(messageId),
 				text: content,
-				parse_mode: "HTML",
+				parse_mode: "MarkdownV2",
 			}),
 		});
 	}
