@@ -1,8 +1,8 @@
 {
-  "name": "@gamalan/pi-gateway",
+  "name": "@rebecca554owen/pi-gateway",
   "version": "1.10.0",
   "description": "Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord, Slack, and more. Real-time streaming, per-chat sessions, and role-based access control.",
-  "author": "0xKobold <original>; forked by gamalan",
+  "author": "forked from gamalan/pi-gateway",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
+    "undici": "^8.7.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
