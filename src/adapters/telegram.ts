@@ -133,6 +133,23 @@ export class TelegramAdapter extends BaseAdapter {
 
 		// Startup notification to configured admin/home channel
 		await this.sendStartupNotification();
+
+		// Register bot command menu
+		await this._registerBotCommands();
+	}
+
+	private async _registerBotCommands(): Promise<void> {
+		const { buildTelegramCommands } = await import("../commands.js");
+		const commands = buildTelegramCommands();
+		if (commands.length === 0) return;
+
+		await this.apiRequest("/setMyCommands", {
+			method: "POST",
+			body: JSON.stringify({ commands }),
+		});
+		logger.info(
+			`[Telegram] Registered ${commands.length} bot commands`,
+		);
 	}
 
 	private async apiRequest(

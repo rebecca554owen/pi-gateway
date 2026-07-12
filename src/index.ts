@@ -57,6 +57,13 @@ import {
 } from "./sessions/store.js";
 import { logger } from "./logger.js";
 import {
+	matchCommand,
+	registerBuiltinCommands,
+	buildTelegramCommands,
+	type CommandContext,
+	type RpcSender,
+} from "./commands.js";
+import {
 	GATEWAY_CONFIG_DIR,
 	GATEWAY_CONFIG_FILE,
 	getPackageRoot,
@@ -693,248 +700,64 @@ const adapterCallbacks: AdapterCallbacks = {
 		// Store session reference
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
 
-		// ── Admin/allowed model commands ──
-		const modelMatch = message.content.match(/^\/model(?:\s+(.+))?/i);
-		const modelCallback = message.content.match(/^Callback:\s*model:(.+)/i);
-
-		if (
-			(modelMatch || modelCallback) &&
-			isUserAllowed(message.platform as Platform, message.userId)
-		) {
+				// ── Slash command dispatch (registry-driven) ──
+		const matched = matchCommand(message.content);
+		if (matched) {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) {
-					await adapter.sendMessage(message.channelId, "Agent not running.");
-				}
-				return;
-			}
-
-			// Handle callback from inline keyboard
-			if (modelCallback) {
-				const key = modelCallback[1].trim();
-				const [provider, modelId] = key.split("/");
-				if (!provider || !modelId) return;
-
-				// Only admins can actually switch models
-				if (!isAdmin(message.platform as Platform, message.userId)) {
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Only admins can switch models.",
-						);
-					}
-					return;
-				}
-
-				try {
-					const result = (await sendRpc("set_model", {
-						provider,
-						modelId,
-					})) as {
-						success: boolean;
-						error?: string;
-						data?: { name: string };
-					};
-					if (result.success) {
-						const name = result.data?.name || `${provider}/${modelId}`;
-						if (adapter) {
-							await adapter.sendMessage(
-								message.channelId,
-								`✅ Model changed to ${name}`,
-							);
-						}
-						logger.info(
-							`[gateway] Admin ${message.userId} switched model to ${provider}/${modelId}`,
-						);
-					} else {
-						if (adapter) {
-							await adapter.sendMessage(
-								message.channelId,
-								`❌ Failed: ${result.error || "unknown"}`,
-							);
-						}
-					}
-				} catch (err) {
-					logger.error("[gateway] Model switch failed:", err);
-				}
-				return;
-			}
-
-			const arg = (modelMatch?.[1] || "").trim().toLowerCase();
-
-			// /model (no args) or /model list → show available models
-			if (!arg || arg === "list") {
-				try {
-					const result = (await sendRpc("get_available_models")) as {
-						success: boolean;
-						data?: {
-							models: Array<{
-								provider: string;
-								id: string;
-								name: string;
-							}>;
-						};
-					};
-					if (result.success && result.data) {
-						const models = result.data.models;
-
-						// Try inline keyboard for Telegram
-						const telegram = adapter as unknown as {
-							sendButtons?: (
-								ch: string,
-								text: string,
-								btns: Array<Array<{ text: string; data: string }>>,
-							) => Promise<string>;
-						};
-						if (telegram?.sendButtons) {
-							const buttons = models.map((m) => [
-								{
-									text: `${m.name} (${m.provider})`,
-									data: `model:${m.provider}/${m.id}`,
-								},
-							]);
-							await telegram.sendButtons(
-								message.channelId,
-								"<b>Available models</b>\nTap to switch:",
-								buttons,
-							);
-						} else if (adapter) {
-							// Text fallback
-							const list = models
-								.map((m) => `• ${m.provider}/${m.id} — ${m.name}`)
-								.join("\n");
-							await adapter.sendMessage(
-								message.channelId,
-								`Available models:\n${list}\n\nUse \`/model provider/id\` to switch.`,
-							);
-						}
-					} else if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Could not retrieve model list.",
-						);
-					}
-				} catch (err) {
-					logger.error("[gateway] Failed to list models:", err);
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Failed to retrieve model list.",
-						);
-					}
-				}
-				return;
-			}
-
-			// /model provider/modelId — only admins can switch
-			if (!isAdmin(message.platform as Platform, message.userId)) {
-				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						"Only admins can switch models. Use `/model` to see available models.",
+						"Agent not running.",
 					);
 				}
 				return;
 			}
 
-			const [provider, modelId] = arg.split("/");
-			if (!provider || !modelId) {
+			const ctx: CommandContext = {
+				message,
+				rpcSend: sendRpc as RpcSender,
+				isAdmin: isAdmin(
+					message.platform as Platform,
+					message.userId,
+				),
+				sendReply: async (text: string) => {
+					if (adapter) {
+						await adapter.sendMessage(message.channelId, text);
+					}
+				},
+				logger: {
+					info: (msg: string) =>
+						logger.info(`[gateway] ${msg}`),
+					error: (msg: string, err?: unknown) =>
+						logger.error(`[gateway] ${msg}`, err),
+				},
+			};
+
+			if (matched.cmd.role === "admin" && !ctx.isAdmin) {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						"Usage: `/model provider/modelId`\n`/model` to see available models.",
+						`Access denied. \`/${matched.cmd.name}\` is an admin command.`,
 					);
 				}
 				return;
 			}
 
-			try {
-				const result = (await sendRpc("set_model", {
-					provider,
-					modelId,
-				})) as { success: boolean; error?: string; data?: { name: string } };
-				if (result.success) {
-					const name = result.data?.name || `${provider}/${modelId}`;
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							`✅ Model changed to ${name}`,
-						);
-					}
-					logger.info(
-						`[gateway] Admin ${message.userId} switched model to ${provider}/${modelId}`,
-					);
-				} else {
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							`❌ Failed: ${result.error || "unknown"}`,
-						);
-					}
-				}
-			} catch (err) {
-				logger.error("[gateway] Failed to change model:", err);
+			if (matched.cmd.handler) {
+				await matched.cmd.handler(matched.args, ctx);
+			} else {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						"Failed to change model.",
+						`Command /${matched.cmd.name} found but no handler registered.`,
 					);
 				}
 			}
 			return;
 		}
 
-		// ── Admin restart command ──
-		if (/^\/restart$/i.test(message.content.trim())) {
-			if (!isAdmin(message.platform as Platform, message.userId)) {
-				// Non-admin: let pi handle it as a normal prompt
-			} else if (IS_DAEMON) {
-				// In daemon mode: restart the entire gateway
-				const adapter = state.adapters.get(message.platform);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"♻️ Restarting gateway daemon…",
-					);
-				}
-				// Send SIGHUP to self for graceful restart
-				process.kill(process.pid, "SIGHUP");
-				return;
-			} else {
-				const adapter = state.adapters.get(message.platform);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"♻️ Restarting pi agent…",
-					);
-				}
-
-				// Kill and restart the pi RPC process
-				if (rpcProcess) {
-					rpcProcess.kill();
-					rpcProcess = null;
-				}
-				// Reject any pending completions
-				while (pendingCompletions.length > 0) {
-					const c = pendingCompletions.shift()!;
-					clearTimeout(c.timer);
-					c.reject(new Error("Agent restarted by admin"));
-				}
-				rpcProcess = createRpcProcess();
-
-				logger.info(`[gateway] Admin ${message.userId} restarted pi agent`);
-
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"✅ Pi agent restarted.",
-					);
-				}
-				return;
-			}
-		}
-
-		// Send to pi agent with tool policy guard
+		// Send to pi agent with tool policy guard// Send to pi agent with tool policy guard
 		if (rpcProcess) {
 			const adapter = state.adapters.get(message.platform);
 			const guard = buildPolicyGuard(message.platform, message.userId);
@@ -2477,6 +2300,7 @@ async function startGatewayServer(port: number): Promise<void> {
 	});
 
 	rpcProcess = createRpcProcess();
+	registerBuiltinCommands();
 	await initializeAdapters();
 	startCron();
 	state.running = true;
